@@ -1,0 +1,250 @@
+cat > $PREFIX/bin/switchfs <<'EOF'
+#!/data/data/com.termux/files/usr/bin/bash
+SD="${SD:-/storage/emulated/0}"
+LOG="$HOME/switchfs.log"
+JOB="$HOME/.switchfs-job"
+TMP=""
+DEST=""
+
+unlock() {
+  if command -v termux-wake-unlock >/dev/null 2>&1; then termux-wake-unlock >/dev/null 2>&1; fi
+}
+trap unlock EXIT
+trap 'echo; echo "Interrupted. Run switchfs again to resume."; exit 130' INT TERM HUP
+
+die() { echo; echo "ERROR: $*" >&2; exit 1; }
+
+fail() {
+  echo; echo "ERROR: $*" >&2
+  echo "Last lines of hactool log:" >&2
+  tail -n 12 "$LOG" >&2 2>/dev/null
+  if [ -n "$DEST" ]; then rm -rf "$DEST/romfs" "$DEST/exefs"; fi
+  echo >&2
+  echo "Progress was kept. Run switchfs again to resume." >&2
+  echo "To discard it instead: rm -rf \"$DEST\"" >&2
+  exit 1
+}
+
+if command -v termux-wake-lock >/dev/null 2>&1; then
+  termux-wake-lock >/dev/null 2>&1
+else
+  echo "Note: termux-wake-lock not found; keep the screen on and Termux in the foreground."
+fi
+
+if ! { [ -d "$SD" ] && [ -w "$SD" ]; }; then
+  echo "Requesting storage permission - tap Allow..."
+  termux-setup-storage
+  for _ in $(seq 1 60); do
+    if { [ -d "$SD" ] && [ -w "$SD" ]; } || [ -w "$HOME/storage/shared" ]; then break; fi
+    sleep 1
+  done
+  if ! { [ -d "$SD" ] && [ -w "$SD" ]; }; then
+    if [ -w "$HOME/storage/shared" ]; then SD="$HOME/storage/shared"; else die "No access to shared storage. Allow storage permission for Termux and run again."; fi
+  fi
+fi
+OUT_ROOT="$SD/SwitchExtract"
+
+if ! command -v hactool >/dev/null 2>&1; then
+  echo "First run: installing requirements (takes a few minutes)..."
+  if ! command -v git >/dev/null 2>&1 || ! command -v clang >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1; then
+    pkg install -y git clang make binutils || { pkg update -y && pkg install -y git clang make binutils; } || die "Could not install packages. Check your connection and run again."
+  fi
+  SRC="$HOME/.hactool-src"
+  rm -rf "$SRC"
+  git clone --depth 1 https://github.com/SciresM/hactool "$SRC" || die "Could not download hactool. Check your connection and run again."
+  cd "$SRC" || die "Missing $SRC"
+  cp config.mk.template config.mk
+  sed -i 's|nca_ctx.tool_ctx->base_file++;|nca_ctx.tool_ctx->base_file = (FILE *)((char *)nca_ctx.tool_ctx->base_file + 1);|' main.c
+  grep -q '(char \*)nca_ctx.tool_ctx->base_file' main.c || die "hactool source changed; patch did not apply."
+  make -j4 >"$LOG" 2>&1 || { tail -n 20 "$LOG"; die "hactool failed to build."; }
+  cp hactool "$PREFIX/bin/hactool" && chmod +x "$PREFIX/bin/hactool"
+  cd "$HOME" || exit 1
+  rm -rf "$SRC"
+  command -v hactool >/dev/null 2>&1 || die "hactool install failed."
+  echo "Requirements installed."
+  echo
+fi
+
+KEYS=""
+for k in "$HOME/.switch/prod.keys" "$SD/prod.keys" "$SD/Download/prod.keys"; do
+  if [ -f "$k" ]; then KEYS="$k"; break; fi
+done
+if [ -z "$KEYS" ]; then
+  KEYS=$(find "$SD" -maxdepth 3 -name prod.keys -not -path "$SD/Android/*" 2>/dev/null | head -n 1)
+fi
+[ -n "$KEYS" ] || die "prod.keys not found. Put it at $SD/prod.keys"
+
+FILES=()
+PICKED=""
+
+scan() {
+  FILES=()
+  local f
+  while IFS= read -r f; do
+    [ "$f" = "$1" ] && continue
+    case "$f" in *.nca|*.NCA) [ "${2:-}" = nca ] || continue ;; esac
+    FILES+=("$f")
+  done < <(find "$SD" \( -path "$SD/Android" -o -path "$OUT_ROOT" \) -prune -o -type f \( -iname '*.nsp' -o -iname '*.xci' -o \( -iname '*.nca' -size +1G \) \) -print 2>/dev/null | sort)
+  [ "${#FILES[@]}" -gt 0 ] || die "No .nsp/.xci (or base .nca over 1 GB) found on $SD"
+}
+
+pick() {
+  local i n
+  if [ "${#FILES[@]}" -eq 1 ]; then
+    PICKED="${FILES[0]}"
+    echo "Found: ${PICKED#"$SD"/}"
+    return
+  fi
+  for i in "${!FILES[@]}"; do
+    printf '%3d) %s  (%s)\n' $((i + 1)) "${FILES[$i]#"$SD"/}" "$(du -h "${FILES[$i]}" | cut -f1)"
+  done
+  while :; do
+    read -rp "$1 " n
+    if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "${#FILES[@]}" ]; then
+      PICKED="${FILES[$((n - 1))]}"
+      return
+    fi
+    echo "Enter a number from 1 to ${#FILES[@]}"
+  done
+}
+
+extract_container() {
+  mkdir -p "$2" || die "Cannot create $2"
+  case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+    *.nsp) hactool -k "$KEYS" -t pfs0 --pfs0dir="$2" "$1" >"$LOG" 2>&1 ;;
+    *.xci) hactool -k "$KEYS" -t xci --securedir="$2" "$1" >"$LOG" 2>&1 ;;
+    *) die "Unsupported file: $1" ;;
+  esac
+  ls "$2"/*.nca >/dev/null 2>&1 || fail "No NCA files came out of $(basename "$1")"
+}
+
+unpack() {
+  if [ -f "$2.done" ]; then
+    echo "      (already unpacked, resuming)"
+    return
+  fi
+  rm -rf "$2"
+  extract_container "$1" "$2"
+  touch "$2.done"
+}
+
+title_key() {
+  local t
+  t=$(ls "$1"/*.tik 2>/dev/null | head -n 1)
+  if [ -n "$t" ]; then
+    od -An -v -tx1 -j 384 -N 16 "$t" | tr -d ' \n'
+  fi
+}
+
+biggest_nca() {
+  ls -S "$1"/*.nca 2>/dev/null | head -n 1
+}
+
+size_of() { stat -c %s "$1"; }
+
+check_space() {
+  local need_kb=$(( ($1 / 1024) * 2 + 1048576 ))
+  local have_kb
+  have_kb=$(df -Pk "$SD" | awk 'NR==2{print $4}')
+  if [ "${have_kb:-0}" -lt "$need_kb" ]; then
+    die "Not enough free space. Need about $((need_kb / 1048576)) GB, have $((have_kb / 1048576)) GB."
+  fi
+}
+
+verify_output() {
+  [ -f "$DEST/exefs/main" ] || fail "exefs/main is missing - wrong NCA or wrong key."
+  [ -n "$(ls -A "$DEST/romfs" 2>/dev/null)" ] || fail "romfs is empty - wrong NCA or wrong key."
+}
+
+RESUME=0
+MODE=""; MAIN=""; BASE=""
+if [ -f "$JOB" ]; then
+  . "$JOB" 2>/dev/null
+  if [ -n "$MAIN" ] && [ -f "$MAIN" ] && { [ "$MODE" = 1 ] || [ -f "$BASE" ]; }; then
+    NAME=$(basename "$MAIN"); NAME="${NAME%.*}"; DEST="$OUT_ROOT/$NAME"
+    if [ -d "$DEST/.tmp" ]; then
+      read -rp "Unfinished job found: $NAME. Resume? [Y/n] (n discards it) " a
+      case "$a" in
+        n | N) rm -rf "$DEST" ;;
+        *) RESUME=1 ;;
+      esac
+    fi
+  fi
+  if [ "$RESUME" = 0 ]; then rm -f "$JOB"; MODE=""; MAIN=""; BASE=""; DEST=""; fi
+fi
+
+if [ "$RESUME" = 0 ]; then
+  echo "Extract:"
+  echo "  1) Game"
+  echo "  2) Update"
+  while :; do
+    read -rp "Choose 1 or 2: " MODE
+    case "$MODE" in 1 | 2) break ;; esac
+  done
+
+  echo
+  echo "Scanning $SD for .nsp / .xci ..."
+  scan ""
+  if [ "$MODE" = 1 ]; then pick "Pick the GAME file:"; else pick "Pick the UPDATE file:"; fi
+  MAIN="$PICKED"
+  BASE=""
+
+  if [ "$MODE" = 2 ]; then
+    echo
+    scan "$MAIN" nca
+    pick "Pick the BASE GAME file this update belongs to:"
+    BASE="$PICKED"
+  fi
+
+  NAME=$(basename "$MAIN")
+  NAME="${NAME%.*}"
+  DEST="$OUT_ROOT/$NAME"
+
+  if [ -e "$DEST" ]; then
+    read -rp "$NAME already exists in SwitchExtract. Overwrite? [y/N] " a
+    case "$a" in y | Y) rm -rf "$DEST" ;; *) echo "Cancelled."; exit 0 ;; esac
+  fi
+
+  total=$(size_of "$MAIN")
+  case "$BASE" in *.nca|*.NCA|"") ;; *) total=$((total + $(size_of "$BASE"))) ;; esac
+  check_space "$total"
+fi
+
+mkdir -p "$DEST/.tmp" || die "Cannot create $DEST"
+TMP="$DEST/.tmp"
+printf 'MODE=%q\nMAIN=%q\nBASE=%q\n' "$MODE" "$MAIN" "$BASE" > "$JOB"
+
+echo
+if [ "$MODE" = 1 ]; then
+  echo "[1/2] Unpacking container..."
+  unpack "$MAIN" "$TMP/game"
+  NCA=$(biggest_nca "$TMP/game")
+  KEY=$(title_key "$TMP/game")
+  echo "[2/2] Extracting romfs and exefs (several minutes for big games)..."
+  rm -rf "$DEST/romfs" "$DEST/exefs"
+  hactool -k "$KEYS" ${KEY:+--titlekey="$KEY"} -t nca \
+    --romfsdir="$DEST/romfs" --exefsdir="$DEST/exefs" "$NCA" >"$LOG" 2>&1
+else
+  case "$BASE" in
+    *.nca|*.NCA) echo "[1/3] Using base game NCA..."; BNCA="$BASE" ;;
+    *) echo "[1/3] Unpacking base game..."; unpack "$BASE" "$TMP/base"; BNCA=$(biggest_nca "$TMP/base") ;;
+  esac
+  echo "[2/3] Unpacking update..."
+  unpack "$MAIN" "$TMP/update"
+  UNCA=$(biggest_nca "$TMP/update")
+  UKEY=$(title_key "$TMP/update")
+  echo "[3/3] Applying update and extracting romfs and exefs (several minutes)..."
+  rm -rf "$DEST/romfs" "$DEST/exefs"
+  hactool -k "$KEYS" ${UKEY:+--titlekey="$UKEY"} --basenca="$BNCA" -t nca \
+    --romfsdir="$DEST/romfs" --exefsdir="$DEST/exefs" "$UNCA" >"$LOG" 2>&1
+fi
+
+verify_output
+rm -rf "$TMP"
+rm -f "$JOB"
+echo
+echo "romfs files: $(find "$DEST/romfs" -type f | wc -l)"
+echo "Done. Point the app at:"
+echo "  $DEST"
+EOF
+chmod +x $PREFIX/bin/switchfs && switchfs
