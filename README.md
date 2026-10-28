@@ -12,6 +12,10 @@ and
 
 2 unpacks both base and update then applies update.
 
-run switchfs to run.
+run
+
+switchfs 
+
+to run.
 
 Completed extraction saves to base android folder in folder called SwitchExtract
