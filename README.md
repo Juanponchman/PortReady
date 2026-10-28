@@ -1,6 +1,6 @@
 
 
-Place roms in main android folder the base folder. Just copy and paste in termux and you will be greeted with two options 
+Place roms and prod.keys in main android folder the base folder. Just copy and paste in termux and you will be greeted with two options 
 
 1 Game 
 
