@@ -65,17 +65,14 @@ if ! command -v hactool >/dev/null 2>&1; then
   echo
 fi
 
-KEYLIST=()
-add_key() {
-  local k="$1" x
-  [ -f "$k" ] || return
-  for x in "${KEYLIST[@]}"; do [ "$x" = "$k" ] && return; done
-  KEYLIST+=("$k")
-}
-add_key "$HOME/.switch/prod.keys"
-while IFS= read -r k; do add_key "$k"; done < <(find "$SD" -maxdepth 4 -name 'prod*.keys' -not -path "$SD/Android/*" -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
-[ "${#KEYLIST[@]}" -gt 0 ] || die "prod.keys not found. Put it at $SD/prod.keys"
-KEYS="${KEYLIST[0]}"
+KEYS=""
+for k in "$HOME/.switch/prod.keys" "$SD/prod.keys" "$SD/Download/prod.keys"; do
+  if [ -f "$k" ]; then KEYS="$k"; break; fi
+done
+if [ -z "$KEYS" ]; then
+  KEYS=$(find "$SD" -maxdepth 3 -name prod.keys -not -path "$SD/Android/*" 2>/dev/null | head -n 1)
+fi
+[ -n "$KEYS" ] || die "prod.keys not found. Put it at $SD/prod.keys"
 
 FILES=()
 PICKED=""
@@ -154,41 +151,9 @@ check_space() {
   fi
 }
 
-output_ok() {
-  [ -f "$DEST/exefs/main" ] && [ -n "$(ls -A "$DEST/romfs" 2>/dev/null)" ]
-}
-
-extract_final() {
-  rm -rf "$DEST/romfs" "$DEST/exefs"
-  if [ "$MODE" = 1 ]; then
-    hactool -k "$1" ${KEY:+--titlekey="$KEY"} -t nca \
-      --romfsdir="$DEST/romfs" --exefsdir="$DEST/exefs" "$NCA" >"$LOG" 2>&1
-  else
-    hactool -k "$1" ${UKEY:+--titlekey="$UKEY"} --basenca="$BNCA" -t nca \
-      --romfsdir="$DEST/romfs" --exefsdir="$DEST/exefs" "$UNCA" >"$LOG" 2>&1
-  fi
-  output_ok
-}
-
-run_final() {
-  local k p
-  for k in "${KEYLIST[@]}"; do
-    if extract_final "$k"; then KEYS="$k"; return 0; fi
-    [ "$k" != "${KEYLIST[$((${#KEYLIST[@]} - 1))]}" ] && echo "      that keys file did not work, trying the next one..."
-  done
-  while :; do
-    echo
-    echo "None of the prod.keys files on this device worked. They are probably older"
-    echo "than the game's firmware. Dump a fresh prod.keys from your own Switch with"
-    echo "Lockpick_RCM on its current firmware and copy it to this device."
-    grep -i 'key' "$LOG" 2>/dev/null | head -n 4
-    echo
-    read -rp "Path to a newer prod.keys (Enter to stop and resume later): " p
-    p="${p%\"}"; p="${p#\"}"
-    [ -n "$p" ] || return 1
-    if [ ! -f "$p" ]; then echo "File not found: $p"; continue; fi
-    if extract_final "$p"; then KEYS="$p"; add_key "$p"; return 0; fi
-  done
+verify_output() {
+  [ -f "$DEST/exefs/main" ] || fail "exefs/main is missing - wrong NCA or wrong key."
+  [ -n "$(ls -A "$DEST/romfs" 2>/dev/null)" ] || fail "romfs is empty - wrong NCA or wrong key."
 }
 
 RESUME=0
@@ -256,6 +221,9 @@ if [ "$MODE" = 1 ]; then
   NCA=$(biggest_nca "$TMP/game")
   KEY=$(title_key "$TMP/game")
   echo "[2/2] Extracting romfs and exefs (several minutes for big games)..."
+  rm -rf "$DEST/romfs" "$DEST/exefs"
+  hactool -k "$KEYS" ${KEY:+--titlekey="$KEY"} -t nca \
+    --romfsdir="$DEST/romfs" --exefsdir="$DEST/exefs" "$NCA" >"$LOG" 2>&1
 else
   case "$BASE" in
     *.nca|*.NCA) echo "[1/3] Using base game NCA..."; BNCA="$BASE" ;;
@@ -266,12 +234,12 @@ else
   UNCA=$(biggest_nca "$TMP/update")
   UKEY=$(title_key "$TMP/update")
   echo "[3/3] Applying update and extracting romfs and exefs (several minutes)..."
+  rm -rf "$DEST/romfs" "$DEST/exefs"
+  hactool -k "$KEYS" ${UKEY:+--titlekey="$UKEY"} --basenca="$BNCA" -t nca \
+    --romfsdir="$DEST/romfs" --exefsdir="$DEST/exefs" "$UNCA" >"$LOG" 2>&1
 fi
 
-if ! run_final; then
-  fail "Extraction did not produce a valid romfs/exefs (keys too old, or wrong files)."
-fi
-mkdir -p "$HOME/.switch" && cp "$KEYS" "$HOME/.switch/prod.keys" 2>/dev/null
+verify_output
 rm -rf "$TMP"
 rm -f "$JOB"
 echo
