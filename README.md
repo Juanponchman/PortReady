@@ -1,6 +1,6 @@
 extracting games to the base folder if required by an android port.
 
-Place roms in main android folder the base folder. Just copy and paste in termux and you will be greet with two options 
+Place roms in main android folder the base folder. Just copy and paste in termux and you will be greeted with two options 
 
 1 Game 
 
