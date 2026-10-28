@@ -19,3 +19,9 @@ switchfs
 to run.
 
 Completed extraction saves to base android folder in folder called SwitchExtract
+
+
+copy paste this
+
+
+https://github.com/Juanponchman/PortReady/blob/main/switchfs
